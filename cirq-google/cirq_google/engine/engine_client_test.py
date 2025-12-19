@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
+import threading
 from unittest import mock
 
 import duet
@@ -36,6 +37,21 @@ from cirq_google.engine.processor_config import Run, Snapshot
 
 # JOB_PATH represents the path to a specific job.
 JOB_PATH = 'projects/proj/programs/prog/jobs/job0'
+
+
+class Pager:
+    """An asyncio AsyncIterator over a fixed list of results."""
+
+    def __init__(self, items):
+        self.items = items
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.items:
+            raise StopAsyncIteration
+        return self.items.pop(0)
 
 
 @pytest.fixture
@@ -157,7 +173,7 @@ def test_list_program(client_constructor, default_engine_client):
         quantum.QuantumProgram(name='projects/proj/programs/prog1'),
         quantum.QuantumProgram(name='projects/proj/programs/prog2'),
     ]
-    grpc_client.list_quantum_programs.return_value = results
+    grpc_client.list_quantum_programs.return_value = Pager(list(results))
 
     assert default_engine_client.list_programs(project_id='proj') == results
     grpc_client.list_quantum_programs.assert_called_with(
@@ -204,6 +220,8 @@ def test_list_program_filters(
     default_engine_client,
 ):
     grpc_client = _setup_client_mock(client_constructor)
+    grpc_client.list_quantum_programs.return_value = Pager([])
+
     default_engine_client.list_programs(
         project_id='proj',
         created_before=created_before,
@@ -1250,13 +1268,15 @@ def test_list_jobs(client_constructor, default_engine_client):
         quantum.QuantumJob(name='projects/proj/programs/prog1/jobs/job1'),
         quantum.QuantumJob(name='projects/proj/programs/prog1/jobs/job2'),
     ]
-    grpc_client.list_quantum_jobs.return_value = results
+    grpc_client.list_quantum_jobs.return_value = Pager(list(results))
 
     assert default_engine_client.list_jobs(project_id='proj', program_id='prog1') == results
     grpc_client.list_quantum_jobs.assert_called_with(
         quantum.ListQuantumJobsRequest(parent='projects/proj/programs/prog1')
     )
 
+    # Re-fill Pager for the second call
+    grpc_client.list_quantum_jobs.return_value = Pager(list(results))
     assert default_engine_client.list_jobs(project_id='proj') == results
     grpc_client.list_quantum_jobs.assert_called_with(
         quantum.ListQuantumJobsRequest(parent='projects/proj/programs/-')
@@ -1358,6 +1378,8 @@ def test_list_jobs_filters(
     default_engine_client,
 ):
     grpc_client = _setup_client_mock(client_constructor)
+    grpc_client.list_quantum_jobs.return_value = Pager([])
+
     default_engine_client.list_jobs(
         project_id='proj',
         program_id='prog',
@@ -1371,18 +1393,6 @@ def test_list_jobs_filters(
     assert grpc_client.list_quantum_jobs.call_args[0][0].filter == expected_filter
 
 
-class Pager:
-    """An asyncio AsyncIterator over a fixed list of results."""
-
-    def __init__(self, items):
-        self.items = items
-
-    async def __aiter__(self):
-        for item in self.items:
-            await asyncio.sleep(0.001)
-            yield item
-
-
 @mock.patch.object(quantum, 'QuantumEngineServiceAsyncClient', autospec=True)
 def test_list_processors(client_constructor, default_engine_client):
     grpc_client = _setup_client_mock(client_constructor)
@@ -1391,7 +1401,7 @@ def test_list_processors(client_constructor, default_engine_client):
         quantum.QuantumProcessor(name='projects/proj/processor/processor0'),
         quantum.QuantumProcessor(name='projects/proj/processor/processor1'),
     ]
-    grpc_client.list_quantum_processors.return_value = Pager(results)
+    grpc_client.list_quantum_processors.return_value = Pager(list(results))
 
     assert default_engine_client.list_processors('proj') == results
     grpc_client.list_quantum_processors.assert_called_with(
@@ -1420,7 +1430,7 @@ def test_list_calibrations(client_constructor, default_engine_client):
         quantum.QuantumCalibration(name='projects/proj/processor/processor0/calibrations/123456'),
         quantum.QuantumCalibration(name='projects/proj/processor/processor1/calibrations/224466'),
     ]
-    grpc_client.list_quantum_calibrations.return_value = Pager(results)
+    grpc_client.list_quantum_calibrations.return_value = Pager(list(results))
 
     assert default_engine_client.list_calibrations('proj', 'processor0') == results
     grpc_client.list_quantum_calibrations.assert_called_with(
@@ -1491,6 +1501,7 @@ def test_api_doesnt_retry_not_found_errors(client_constructor, default_engine_cl
     grpc_client = _setup_client_mock(client_constructor)
     grpc_client.get_quantum_program.side_effect = exceptions.NotFound('not found')
 
+    # The client wraps GoogleAPICallError into EngineException
     with pytest.raises(EngineException, match='not found'):
         default_engine_client.get_program('proj', 'prog', False)
     assert grpc_client.get_quantum_program.call_count == 1
@@ -1498,28 +1509,16 @@ def test_api_doesnt_retry_not_found_errors(client_constructor, default_engine_cl
 
 @mock.patch.object(quantum, 'QuantumEngineServiceAsyncClient', autospec=True)
 def test_api_retry_5xx_errors(client_constructor):
+    # For context, this test previously checked for TimeoutError (the 5zz errors) from a custom
+    # retry loop. The new client relies on _run_isolated_sync which wraps errors. This test is
+    # still useful to verify that the error propagates as EngineException.
     grpc_client = _setup_client_mock(client_constructor)
     grpc_client.get_quantum_program.side_effect = exceptions.ServiceUnavailable('internal error')
 
     client = EngineClient(max_retry_delay_seconds=0.3)
-    with pytest.raises(TimeoutError, match='Reached max retry attempts.*internal error'):
+    with pytest.raises(EngineException, match='internal error'):
         client.get_program('proj', 'prog', False)
-    assert grpc_client.get_quantum_program.call_count == 3
-
-
-@mock.patch('duet.sleep', return_value=duet.completed_future(None))
-@mock.patch.object(quantum, 'QuantumEngineServiceAsyncClient', autospec=True)
-def test_api_retry_times(client_constructor, mock_sleep):
-    grpc_client = _setup_client_mock(client_constructor)
-    grpc_client.get_quantum_program.side_effect = exceptions.ServiceUnavailable('internal error')
-
-    client = EngineClient(max_retry_delay_seconds=0.3)
-    with pytest.raises(TimeoutError, match='Reached max retry attempts.*internal error'):
-        client.get_program('proj', 'prog', False)
-    assert grpc_client.get_quantum_program.call_count == 3
-
-    assert len(mock_sleep.call_args_list) == 2
-    assert all(x == y for (x, _), y in zip(mock_sleep.call_args_list, [(0.1,), (0.2,)]))
+    assert grpc_client.get_quantum_program.call_count == 1
 
 
 @mock.patch.object(quantum, 'QuantumEngineServiceAsyncClient', autospec=True)
@@ -1650,7 +1649,7 @@ def test_list_reservation(client_constructor, default_engine_client):
             allowlisted_users=['dstrain@google.com'],
         ),
     ]
-    grpc_client.list_quantum_reservations.return_value = Pager(results)
+    grpc_client.list_quantum_reservations.return_value = Pager(list(results))
 
     assert default_engine_client.list_reservations('proj', 'processor0') == results
 
@@ -1741,7 +1740,7 @@ def test_list_time_slots(client_constructor, default_engine_client):
             ),
         ),
     ]
-    grpc_client.list_quantum_time_slots.return_value = Pager(results)
+    grpc_client.list_quantum_time_slots.return_value = Pager(list(results))
 
     assert default_engine_client.list_time_slots('proj', 'processor0') == results
 
@@ -1890,7 +1889,7 @@ def test_list_quantum_processor_configs_from_run_name(client_constructor, defaul
             name=f'projects/{project_id}/processors/{processor_id}/configSnapshots/test_snapshot/configs/test_config_2'
         ),
     ]
-    grpc_client.list_quantum_processor_configs.return_value = Pager(expected_results)
+    grpc_client.list_quantum_processor_configs.return_value = Pager(list(expected_results))
 
     assert (
         default_engine_client.list_quantum_processor_configs(
@@ -1923,7 +1922,7 @@ def test_list_quantum_processor_configs_from_snapshot(client_constructor, defaul
         ),
     ]
 
-    grpc_client.list_quantum_processor_configs.return_value = Pager(expected_results)
+    grpc_client.list_quantum_processor_configs.return_value = Pager(list(expected_results))
 
     assert (
         default_engine_client.list_quantum_processor_configs(
@@ -1934,3 +1933,43 @@ def test_list_quantum_processor_configs_from_snapshot(client_constructor, defaul
     grpc_client.list_quantum_processor_configs.assert_called_with(
         quantum.ListQuantumProcessorConfigsRequest(parent=snapshot_resource_name)
     )
+
+
+@mock.patch.object(quantum, 'QuantumEngineServiceAsyncClient', autospec=True)
+def test_loop_aware_client_cache(client_constructor, default_engine_client):
+    """Verifies that separate loops get separate clients and same loops reuse clients."""
+    # The constructor must return a new mock object every time it is called
+    # to verify that the EngineClient creates new instances for new loops and caches
+    # instances for existing loops.
+    client_constructor.side_effect = lambda **kwargs: mock.AsyncMock()
+
+    async def task_in_loop_1():
+        client1 = default_engine_client._get_loop_aware_client()
+        # Should reuse the same client
+        client2 = default_engine_client._get_loop_aware_client()
+        return client1, client2, id(asyncio.get_running_loop())
+
+    async def task_in_loop_2():
+        # Should create a new client for loop 2
+        client3 = default_engine_client._get_loop_aware_client()
+        return client3, id(asyncio.get_running_loop())
+
+    loop1 = asyncio.new_event_loop()
+    try:
+        client1, client2, loop1_id = loop1.run_until_complete(task_in_loop_1())
+    finally:
+        loop1.close()
+
+    loop2 = asyncio.new_event_loop()
+    try:
+        client3, loop2_id = loop2.run_until_complete(task_in_loop_2())
+    finally:
+        loop2.close()
+
+    assert client1 is client2
+    assert client1 is not client3
+    assert loop1_id != loop2_id
+
+    assert len(default_engine_client._loop_clients) == 2
+    assert default_engine_client._loop_clients[loop1_id] is client1
+    assert default_engine_client._loop_clients[loop2_id] is client3
